@@ -1,0 +1,23 @@
+<Type Name="Context" FullName="LibGPhoto2.GPhoto2.Base.Context">
+  <TypeSignature Language="C#" Value="public class Context : LibGPhoto2.GPhoto2.Base.Object" />
+  <AssemblyInfo>
+    <AssemblyName>libgphoto2-sharp</AssemblyName>
+    <AssemblyVersion>4.0.2586.37531</AssemblyVersion>
+  </AssemblyInfo>
+  <Base>
+    <BaseTypeName>LibGPhoto2.GPhoto2.Base.Object</BaseTypeName>
+  </Base>
+  <Interfaces />
+  <Members>
+    <Member MemberName=".ctor">
+      <MemberSignature Language="C#" Value="public Context ();" />
+      <MemberType>Constructor</MemberType>
+      <Parameters />
+      <Docs><summary>To be added.</summary><remarks>To be added.</remarks></Docs>
+    </Member>
+  </Members>
+  <Docs>
+    <summary>To be added.</summary>
+    <remarks>To be added.</remarks>
+  </Docs>
+</Type>

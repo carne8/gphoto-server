@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="YoLo.fs" />
+    <Compile Include="GPhoto.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="Libs/FSharp.Control.Reactive/FSharp.Control.Reactive.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Falco" Version="4.*" />
+    <PackageReference Include="FsToolkit.ErrorHandling.TaskResult" Version="4.16.0" />
+  </ItemGroup>
+</Project>
