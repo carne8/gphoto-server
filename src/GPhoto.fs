@@ -24,8 +24,13 @@ module Process =
         p.EnableRaisingEvents <- true
         p.Start() |> ignore
 
-        ct.Register(fun () -> p.Close()) |> ignore
+        ct.Register(fun () ->
+            p.Kill()
+            p.Close()
+            p.Dispose()
+        ) |> ignore
 
+        p.StandardInput.AutoFlush <- false
         p
 
     let getOutput ct (proc: Process) =
@@ -49,18 +54,179 @@ module Process =
             return res
         }
 
-
 type Camera =
     { Model: string; Port: string }
     static member isNikon camera =
         camera.Model |> String.toLower |> String.contains "nikon"
 
-let execGPhoto ct camera args =
-    Seq.append
-        [ "--port"; camera.Port ]
-        args
-    |> Process.exec ct "gphoto2"
-    |> Process.getOutput ct
+
+type Shell(camera: Camera, ?sourceCt: CancellationToken) =
+    let cts = new CancellationTokenSource()
+    let ct = cts.Token
+
+    do
+        match sourceCt with
+        | None -> ()
+        | Some sourceCt ->
+            sourceCt.Register(fun _ -> cts.Cancel())
+            |> ignore
+
+    let proc =
+        [ "--port"; camera.Port; "--shell" ]
+        |> Process.exec ct "gphoto2"
+
+    let waitCommandEnd (ct: CancellationToken) debug =
+        task {
+            let tcs = new TaskCompletionSource<string>()
+            let mutable str = ""
+
+            if debug then printfn ""
+            while
+                not proc.StandardOutput.EndOfStream
+                && not ct.IsCancellationRequested
+                && not tcs.Task.IsCompleted
+                do
+                let buffer = new System.Memory<_>(Array.zeroCreate 1)
+                let! readCount = proc.StandardOutput.ReadAsync(buffer, ct)
+
+                if readCount > 0 then
+                    let char = buffer.ToArray() |> Array.head
+                    str <- str + (string char)
+
+                    if debug then printfn "%c" char
+                    if debug then printfn "%A" str
+
+                    let isEnd =
+                        try
+                            str
+                            |> String.split System.Environment.NewLine
+                            |> Seq.tail
+                            |> Seq.tryFind (String.contains "/>")
+                            |> Option.isSome
+                        with _ -> false
+
+                    if debug then printfn "%A" isEnd
+                    match isEnd with
+                    | false -> ()
+                    | true -> tcs.SetResult str
+
+            return! tcs.Task
+        }
+
+    interface System.IDisposable with
+        override _.Dispose (): unit =
+            cts.Cancel()
+    member this.Dispose() = (this: System.IDisposable).Dispose()
+
+    member private _.ExecuteCmd(command: string, ?debug: bool) =
+        if ct.IsCancellationRequested then
+            "Cancelled"
+            |> Error
+            |> Task.singleton
+        else
+            proc.StandardInput.WriteLine(command)
+            proc.StandardInput.Flush()
+
+            let task = waitCommandEnd ct (debug |> Option.defaultValue false)
+
+            task.WaitAsync(new System.TimeSpan(0, 0, 10), ct)
+            |> Task.catch
+            |> Task.map (function
+                | Choice1Of2 str ->
+                    match str.ToLower().Contains "error" with
+                    | true -> Error str
+                    | false -> Ok str
+                | Choice2Of2 exn -> Error exn.Message
+            )
+
+    member this.GetShotBuffer() =
+        taskResult {
+            let! maxShotsStr =
+                this.ExecuteCmd("get-config maximumshots", false)
+                |> TaskResult.orElseWith (fun _ ->
+                    this.ExecuteCmd("get-config continousshootingcount", false)
+                )
+                |> TaskResult.mapError (sprintf "Failed to get max shots: %s")
+
+            return!
+                maxShotsStr
+                |> String.split "\n"
+                |> Array.tryPick (fun line ->
+                    let m = Regex.Match(line, "Current: (\d+)")
+                    match m.Success with
+                    | false -> None
+                    | true ->
+                        m.Groups
+                        |> Seq.tryItem 1
+                        |> Option.map (_.Value >> int)
+                )
+                |> Result.requireSome (sprintf "Failed to parse maximum shots: %s" maxShotsStr)
+        }
+
+    member this.TriggerCapture() =
+        taskResult {
+            let! maximumShots =
+                this.GetShotBuffer()
+                |> TaskResult.mapError (sprintf "Failed to get maximum shots: %s")
+
+            do! maximumShots > 0
+                |> Result.requireTrue "No shots left, try again later"
+
+            do! this.ExecuteCmd("trigger-capture", false)
+                |> TaskResult.mapError (sprintf "Failed to to trigger capture: %s")
+                |> TaskResult.ignore
+        }
+
+    member this.CaptureImage() =
+        taskResult {
+            let! maximumShots =
+                this.GetShotBuffer()
+                |> TaskResult.mapError (sprintf "Failed to get maximum shots: %s")
+
+            do! maximumShots > 0
+                |> Result.requireTrue "No shots left, try again later"
+
+            do! this.ExecuteCmd("filename %Y-%m-%d/%H-%M-%S.%C", false)
+                |> TaskResult.mapError (sprintf "Failed to set image name: %s")
+                |> TaskResult.ignore
+
+            do! this.ExecuteCmd("capture-image", false)
+                |> TaskResult.mapError (sprintf "Failed to capture image: %s")
+                |> TaskResult.ignore
+        }
+
+    member this.SetCaptureTargetToMemoryCard() =
+        taskResult {
+            let! captureTargets =
+                "get-config capturetarget"
+                |> this.ExecuteCmd
+                |> TaskResult.mapError (sprintf "Failed to get capture target: %s")
+
+            let! captureTarget =
+                captureTargets
+                |> String.split "\n"
+                |> Array.tryPick (fun line ->
+                    let m = Regex.Match(line, "Choice: (\d)+ Memory card")
+                    match m.Success with
+                    | false -> None
+                    | true ->
+                        m.Groups
+                        |> Seq.tryItem 1
+                        |> Option.map (_.Value >> int)
+                )
+                |> Result.requireSome (
+                    sprintf
+                        "Failed to parse capture target or can't find memory card capture target:\n%s"
+                        captureTargets
+                )
+
+            do!
+                sprintf "set-config capturetarget=%i" captureTarget
+                |> this.ExecuteCmd
+                |> TaskResult.mapError (sprintf "Failed to set capture target to memory card: %s")
+                |> TaskResult.ignore
+        }
+
 
 let autoDetectCameras ct =
     taskResult {
@@ -83,98 +249,3 @@ let autoDetectCameras ct =
 
         return cameras
     }
-
-let getMaximumShots ct camera =
-    let getMaximumShots () =
-        [ "--get-config"; "maximumshots" ]
-        |> execGPhoto ct camera
-
-    let getContinousShootingCount () =
-        [ "--get-config"; "continousshootingcount" ]
-        |> execGPhoto ct camera
-
-    getMaximumShots()
-    |> Task.bind (function
-        | Ok res -> res |> Ok |> Task.singleton
-        | Error _ -> getContinousShootingCount ()
-    )
-    |> TaskResult.mapError (sprintf "Failed to get maximum shots: %s")
-    |> Task.map (Result.bind (fun output ->
-        output
-        |> String.split "\n"
-        |> Array.tryPick (fun line ->
-            let m = Regex.Match(line, "Current: (\d+)")
-            match m.Success with
-            | false -> None
-            | true ->
-                m.Groups
-                |> Seq.tryItem 1
-                |> Option.map (_.Value >> int)
-        )
-        |> Result.requireSome "Failed to parse maximum shots"
-    ))
-
-let captureImage ct camera =
-    taskResult {
-        let! maximumShots =
-            getMaximumShots ct camera
-            |> TaskResult.mapError (sprintf "Failed to get maximum shots: %s")
-
-        do! maximumShots > 0
-            |> Result.requireTrue "No shots left, try again later"
-
-        do! [ "--filename"; "%Y-%m-%d/%H-%M-%S.%C"
-              "--capture-image" ]
-            |> execGPhoto ct camera
-            |> TaskResult.mapError (sprintf "Failed to capture image: %s")
-            |> TaskResult.ignore
-    }
-    |> TaskResult.ignore
-
-let triggerCapture ct camera =
-    taskResult {
-        let! maximumShots =
-            getMaximumShots ct camera
-            |> TaskResult.mapError (sprintf "Failed to get maximum shots: %s")
-
-        do! maximumShots > 0
-            |> Result.requireTrue "No shots left, try again later"
-
-        do! [ "--trigger-capture" ]
-            |> execGPhoto ct camera
-            |> TaskResult.mapError (sprintf "Failed to to trigger capture: %s")
-            |> TaskResult.ignore
-    }
-
-let setCaptureTargetToMemoryCard ct camera =
-    taskResult {
-        let! captureTargets =
-            [ "--get-config"; "capturetarget" ]
-            |> execGPhoto ct camera
-            |> TaskResult.mapError (sprintf "Failed to get capture target: %s")
-
-        let! captureTarget =
-            captureTargets
-            |> String.split "\n"
-            |> Array.tryPick (fun line ->
-                let m = Regex.Match(line, "Choice: (\d)+ Memory card")
-                match m.Success with
-                | false -> None
-                | true ->
-                    m.Groups
-                    |> Seq.tryItem 1
-                    |> Option.map (_.Value >> int)
-            )
-            |> Result.requireSome (
-                sprintf
-                    "Failed to parse capture target or can't find memory card capture target:\n%s"
-                    captureTargets
-            )
-
-        return
-            [ "--set-config"
-              sprintf "capturetarget=%i" captureTarget ]
-            |> execGPhoto ct camera
-            |> TaskResult.mapError (sprintf "Failed to set capture target to memory card: %s")
-    }
-    |> TaskResult.ignore

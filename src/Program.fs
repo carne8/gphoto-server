@@ -9,7 +9,6 @@ open FsToolkit.ErrorHandling
 open System.Threading.Tasks
 open System.Threading
 open System
-open System.Collections.Generic
 
 // --- Falco helpers ---
 let trHandlerToHandler ctx tr =
@@ -41,21 +40,24 @@ let getCamera ct =
         return cam
     }
 
-let intervalCapture ct (interval: TimeSpan) count camera =
+let intervalCapture
+    (count: int)
+    (interval: TimeSpan)
+    (shell: GPhoto.Shell)
+    (ct: CancellationToken)
+    =
     task {
         let mutable shotsDone = 0
 
         while shotsDone < count do
-            printfn "Capture"
-            let! res = camera |> GPhoto.triggerCapture ct
-            printfn "Captured"
+            let! res = shell.TriggerCapture()
             match res with
             | Ok _ ->
-                printfn "Done"
                 shotsDone <- shotsDone + 1
+                printfn "Done %i" shotsDone
                 do! Task.Delay(interval, ct)
             | Error err ->
-                printfn "Error while interval capture: %s" err
+                printfn "Failed: %i" (shotsDone + 1)
                 do! Task.Delay(TimeSpan.FromMilliseconds(100), ct) // Wait before retrying
     }
 
@@ -98,7 +100,8 @@ let rootHandler (ctx: HttpContext) =
 let setCaptureTargetHandler (ctx: HttpContext) =
     taskResult {
         let! camera = getCamera ctx.RequestAborted
-        do! camera |> GPhoto.setCaptureTargetToMemoryCard CancellationToken.None
+        use shell = new GPhoto.Shell(camera)
+        do! shell.SetCaptureTargetToMemoryCard()
 
         return "Capture target set to memory card"
     }
@@ -107,17 +110,20 @@ let setCaptureTargetHandler (ctx: HttpContext) =
 let captureHandler (ctx: HttpContext) =
     taskResult {
         let! camera = getCamera ctx.RequestAborted
-        do! camera
-            |> GPhoto.triggerCapture CancellationToken.None
+        use shell = new GPhoto.Shell(camera, ctx.RequestAborted)
 
-        return "Image capturing"
+        do! shell.TriggerCapture()
+
+        return "Image captured"
     }
     |> trHandlerToHandler ctx
 
 let captureAndWaitHandler (ctx: HttpContext) =
     taskResult {
         let! camera = getCamera ctx.RequestAborted
-        do! camera |> GPhoto.captureImage CancellationToken.None
+        use shell = new GPhoto.Shell(camera)
+
+        do! shell.CaptureImage()
 
         return "Image captured"
     }
@@ -131,18 +137,22 @@ let intervalCaptureHandler (ctx: HttpContext) =
             |> Result.requireSome "Missing 'count' query parameter"
 
         let interval =
-            query.TryGetInt "interval"
+            query.TryGetFloat "interval"
             |> Option.defaultValue 0
             |> TimeSpan.FromSeconds
 
         let! camera = getCamera ctx.RequestAborted
+        let shell = new GPhoto.Shell(camera)
+
+        do! shell.SetCaptureTargetToMemoryCard()
 
         // Start capturing images at intervals
-        camera
-        |> intervalCapture
-            CancellationToken.None
-            interval
+        intervalCapture
             count
+            interval
+            shell
+            CancellationToken.None
+        |> Task.map (fun _ -> shell.Dispose())
         |> ignore
 
         return "Started capturing images"
